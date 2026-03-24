@@ -127,7 +127,7 @@ class TargetTracker:
 
         # --- Перелёт в точку (2,2) по aruco_map ---
         rospy.loginfo("Перелёт в точку (2,2)")
-        if not self.navigate_wait(x=2, y=2, z=self.height, frame_id='aruco_map', speed=0.5):
+        if not self.navigate_wait(x=2, y=0, z=self.height, frame_id='aruco_map', speed=0.5):
             rospy.logwarn("Не удалось достичь (2,2), продолжаем...")
 
         # --- Стабилизация ---
