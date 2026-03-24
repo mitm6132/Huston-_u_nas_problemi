@@ -26,7 +26,7 @@ class TargetTracker:
         self.range = None
         self.image_width = 640
         self.image_height = 480
-        rospy.Subscriber('/front_vision/detections', DetectionArray, self.detections_cb)
+        rospy.Subscriber('/vision/debug_image', DetectionArray, self.detections_cb)
         rospy.Subscriber('/front_rangefinder/range', Range, self.range_cb)
         rospy.Subscriber('/front_main_camera/camera_info', CameraInfo, self.camera_info_cb)
 
