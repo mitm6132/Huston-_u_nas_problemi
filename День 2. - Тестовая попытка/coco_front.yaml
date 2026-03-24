@@ -1,0 +1,14 @@
+enabled: true
+model_name: "coco_front"
+model_path: "/home/pi/catkin_ws/src/models/yolo/yolov8n_int8.tflite"
+labels_path: "/home/pi/catkin_ws/src/models/yolo/coco80.txt"
+decoder_type: "yolo_tflite"
+image_topic: "/front_main_camera/image_raw"
+detections_topic: "/vision/detections"
+debug_image_topic: "/vision/debug_image"
+frame_skip: 2
+score_threshold: 0.35
+max_detections: 30
+publish_debug: true
+num_threads: 4
+target_classes: []

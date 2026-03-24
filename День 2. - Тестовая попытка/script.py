@@ -1,269 +1,311 @@
 #!/usr/bin/env python3
-
 import rospy
 import math
 import time
 from clover import srv
 from std_srvs.srv import Trigger
-from sensor_msgs.msg import Range
+from sensor_msgs.msg import Range, CameraInfo
 from clover_yolo.msg import DetectionArray, Detection
-from geometry_msgs.msg import Point
+from aruco_pose.msg import MarkerArray
+from geometry_msgs.msg import Pose, Point
 
-class TargetTracker:
+class PersonTracker:
     def __init__(self):
-        rospy.init_node('target_tracker')
-        
+        rospy.init_node('person_tracker', anonymous=True)
+
         # Сервисы Clover
-        self.get_telemetry = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
+        rospy.wait_for_service('navigate')
+        rospy.wait_for_service('get_telemetry')
+        rospy.wait_for_service('set_yaw')
+        rospy.wait_for_service('land')
+        rospy.wait_for_service('set_position')
         self.navigate = rospy.ServiceProxy('navigate', srv.Navigate)
-        self.set_position = rospy.ServiceProxy('set_position', srv.SetPosition)
-        self.set_velocity = rospy.ServiceProxy('set_velocity', srv.SetVelocity)
+        self.get_telemetry = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
         self.set_yaw = rospy.ServiceProxy('set_yaw', srv.SetYaw)
         self.land = rospy.ServiceProxy('land', Trigger)
-        
-        # Параметры
-        self.target_distance = 1.5  # Заданная дистанция до цели (м)
-        self.working_height = 1.5   # Рабочая высота (м)
-        self.min_safe_distance = 0.5  # Минимальная безопасная дистанция (м)
-        self.tracking_time = 20     # Время сопровождения (с)
-        self.max_attempts = 300     # Максимальное время попытки (с)
-        
-        # Переменные состояния
-        self.target_id = None
-        self.current_target = None
-        self.is_tracking = False
-        self.tracking_start_time = None
-        self.lost_counter = 0
-        self.max_lost_frames = 10
-        
-        # Параметры управления
-        self.kp_distance = 0.5      # Коэффициент регулятора дистанции
-        self.kp_yaw = 1.5           # Коэффициент регулятора курса
-        self.max_speed = 0.5        # Максимальная скорость (м/с)
-        self.max_yaw_rate = 45      # Максимальная угловая скорость (град/с)
-        
+        self.set_position = rospy.ServiceProxy('set_position', srv.SetPosition)
+
         # Подписки
-        self.detections_sub = rospy.Subscriber('/vision/detections', DetectionArray, self.detections_callback)
-        self.rangefinder_sub = rospy.Subscriber('/front_rangefinder/range', Range, self.rangefinder_callback)
+        self.detections = None
+        self.range = None
+        self.aruco_markers = []
+        self.aruco_map = {}  # Словарь с позициями маркеров
+        self.current_pose = None
+        self.image_width = 640
+        self.image_height = 480
         
-        # Текущие данные
-        self.current_range = None
-        self.current_detections = []
+        rospy.Subscriber('/vision/detections', DetectionArray, self.detections_cb)
+        rospy.Subscriber('/front_rangefinder/range', Range, self.range_cb)
+        rospy.Subscriber('/aruco_pose/markers', MarkerArray, self.aruco_cb)
+        rospy.Subscriber('/front_main_camera/camera_info', CameraInfo, self.camera_info_cb)
         
-        # Состояния автомата
-        self.state = "INIT"  # INIT, TAKEOFF, DETECTING, TRACKING, LOST, RETURN, LAND
+        # Получаем текущую позицию через телеметрию
+        self.update_pose()
+
+        # Параметры
+        self.target_distance = 1.5      # целевая дистанция (м)
+        self.tracking_time = 120.0      # время удержания (с)
+        self.height = 1.5               # высота полёта (м)
+        self.speed_fwd = 0.3            # скорость вперёд/назад
         
-        # Время начала миссии
-        self.start_time = time.time()
+        # Коэффициент регулятора дистанции
+        self.kp_dist = 0.8
         
-        rospy.loginfo("Target Tracker инициализирован")
-    
-    def detections_callback(self, msg):
-        """Обработка детекций от нейросети"""
-        self.current_detections = msg.detections
-        
-        # Для отладки
-        if len(msg.detections) > 0:
-            rospy.logdebug(f"Получено {len(msg.detections)} детекций")
-            for det in msg.detections:
-                rospy.logdebug(f"ID: {det.id}, Class: {det.class_name}, Score: {det.score:.2f}")
-    
-    def rangefinder_callback(self, msg):
-        """Обработка данных дальномера"""
-        self.current_range = msg.range
-        rospy.logdebug(f"Текущая дистанция: {self.current_range:.2f} м")
-    
-    def select_target(self):
-        """Выбор целевой фигуры человека"""
-        target_persons = [d for d in self.current_detections if d.class_name == 'target_person']
-        
-        if not target_persons:
-            rospy.logwarn("Целевые фигуры не обнаружены")
-            return None
-        
-        # Выбираем фигуру с максимальным score в центре кадра
-        best_target = None
-        best_score = 0
-        
-        for person in target_persons:
-            # Приоритет: чем ближе к центру и выше score
-            center_x = person.bbox.center.x
-            center_y = person.bbox.center.y
-            center_score = 1.0 - math.sqrt((center_x - 0.5)**2 + (center_y - 0.5)**2)
-            total_score = person.score * (0.7 + 0.3 * center_score)
+        # Состояние
+        self.selected_target = None
+        self.tracking_start = None
+        self.last_height_keep_time = 0
+        self.current_yaw = 0
+        self.target_reached = False
+
+    def update_pose(self):
+        """Обновить текущую позицию дрона"""
+        try:
+            telem = self.get_telemetry(frame_id='aruco_map')
+            self.current_pose = telem
+            return True
+        except:
+            return False
+
+    def detections_cb(self, msg):
+        self.detections = msg
+
+    def range_cb(self, msg):
+        self.range = msg.range
+
+    def aruco_cb(self, msg):
+        self.aruco_markers = msg.markers
+        # Обновляем карту маркеров
+        for marker in msg.markers:
+            self.aruco_map[marker.id] = marker.pose.pose.position
+            rospy.logdebug(f"ArUco {marker.id}: x={marker.pose.pose.position.x:.2f}, y={marker.pose.pose.position.y:.2f}")
+
+    def camera_info_cb(self, msg):
+        self.image_width = msg.width
+        self.image_height = msg.height
+
+    def navigate_to_aruco_point(self, target_x, target_y, target_z=None):
+        """Навигация к точке с использованием ArUco карты"""
+        if target_z is None:
+            target_z = self.height
             
-            if total_score > best_score:
-                best_score = total_score
-                best_target = person
+        rospy.loginfo(f"Летим к точке: x={target_x}, y={target_y}")
         
-        if best_target:
-            rospy.loginfo(f"Выбрана цель ID: {best_target.id}, Score: {best_target.score:.2f}, Class: {best_target.class_name}")
-            return best_target
-        return None
-    
-    def calculate_control(self, detection, current_range):
-        """Расчет управляющих воздействий на основе детекции и дальномера"""
-        if detection is None or current_range is None:
-            return 0, 0, 0  # velocity_x, velocity_y, yaw_rate
+        # Используем set_position для точного позиционирования
+        self.set_position(x=target_x, y=target_y, z=target_z, 
+                         yaw=float('nan'), frame_id='map')
         
-        # Ошибка по дистанции
-        distance_error = current_range - self.target_distance
-        velocity_forward = -self.kp_distance * distance_error
-        velocity_forward = max(min(velocity_forward, self.max_speed), -self.max_speed)
+        # Ждём достижения цели
+        while not rospy.is_shutdown():
+            self.update_pose()
+            if self.current_pose:
+                dist = math.sqrt((self.current_pose.x - target_x)**2 + 
+                                (self.current_pose.y - target_y)**2)
+                if dist < 0.2:
+                    rospy.loginfo(f"Точка достигнута: {dist:.2f}м")
+                    return True
+            rospy.sleep(0.1)
         
-        # Ошибка по положению в кадре (центрирование)
-        center_x = detection.bbox.center.x
-        center_error = center_x - 0.5
-        yaw_rate = self.kp_yaw * center_error * self.max_yaw_rate
-        yaw_rate = max(min(yaw_rate, self.max_yaw_rate), -self.max_yaw_rate)
+        return False
+
+    def navigate_to_aruco_marker(self, marker_id, offset_x=0, offset_y=0):
+        """Навигация к ArUco маркеру"""
+        rospy.loginfo(f"Ищем маркер {marker_id}...")
         
-        # Горизонтальное выравнивание
-        center_y = detection.bbox.center.y
-        height_error = center_y - 0.5
-        velocity_vertical = 0  # Высота фиксирована
+        # Ждём появления маркера
+        start_time = time.time()
+        while marker_id not in self.aruco_map and time.time() - start_time < 10:
+            rospy.sleep(0.1)
         
-        return velocity_forward, 0, yaw_rate  # vx, vy, yaw_rate
-    
-    def check_target_in_frame(self, detection):
-        """Проверка, находится ли цель в центре кадра"""
-        if detection is None:
+        if marker_id not in self.aruco_map:
+            rospy.logerr(f"Маркер {marker_id} не найден!")
             return False
         
-        center_x = detection.bbox.center.x
-        center_y = detection.bbox.center.y
+        marker_pos = self.aruco_map[marker_id]
+        target_x = marker_pos.x + offset_x
+        target_y = marker_pos.y + offset_y
         
-        # Цель считается в кадре, если находится в центральной области
-        return abs(center_x - 0.5) < 0.3 and abs(center_y - 0.5) < 0.3
-    
+        rospy.loginfo(f"Маркер {marker_id} найден: x={marker_pos.x:.2f}, y={marker_pos.y:.2f}")
+        rospy.loginfo(f"Летим к точке: x={target_x:.2f}, y={target_y:.2f}")
+        
+        return self.navigate_to_aruco_point(target_x, target_y)
+
+    def navigate_wait(self, x=0, y=0, z=0, yaw=float('nan'), speed=0.5,
+                      frame_id='body', tolerance=0.2, auto_arm=False):
+        """Ожидание завершения движения"""
+        res = self.navigate(x=x, y=y, z=z, yaw=yaw, speed=speed,
+                            frame_id=frame_id, auto_arm=auto_arm)
+        if not res.success:
+            rospy.logerr("navigate failed: " + res.message)
+            return False
+        while not rospy.is_shutdown():
+            telem = self.get_telemetry(frame_id='navigate_target')
+            dist = math.sqrt(telem.x**2 + telem.y**2 + telem.z**2)
+            if dist < tolerance:
+                return True
+            rospy.sleep(0.1)
+        return False
+
+    def get_aruco_position(self, marker_id):
+        """Получить позицию ArUco маркера из карты"""
+        return self.aruco_map.get(marker_id)
+
+    def select_target(self):
+        """Выбрать человека с самой большой площадью bounding box"""
+        if self.detections is None or not self.detections.detections:
+            return None
+        persons = [d for d in self.detections.detections if d.class_name == "person"]
+        if not persons:
+            return None
+        return max(persons, key=lambda d: (d.x_max - d.x_min)*(d.y_max - d.y_min))
+
+    def iou(self, a, b):
+        """Intersection over Union для отслеживания цели"""
+        x1 = max(a.x_min, b.x_min)
+        y1 = max(a.y_min, b.y_min)
+        x2 = min(a.x_max, b.x_max)
+        y2 = min(a.y_max, b.y_max)
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area_a = (a.x_max - a.x_min)*(a.y_max - a.y_min)
+        area_b = (b.x_max - b.x_min)*(b.y_max - b.y_min)
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0
+
+    def keep_height(self):
+        """Поддержание высоты через ArUco карту"""
+        now = time.time()
+        if now - self.last_height_keep_time >= 1.0:
+            self.update_pose()
+            if self.current_pose:
+                self.set_position(x=self.current_pose.x, y=self.current_pose.y, 
+                                z=self.height, frame_id='aruco_map')
+            self.last_height_keep_time = now
+
+    def search_for_person(self):
+        """Поиск человека с поворотами на 45 градусов"""
+        rospy.loginfo("Ищу человека...")
+        
+        # Делаем 8 поворотов по 45 градусов (полный круг)
+        for i in range(8):
+            self.current_yaw += 45
+            rospy.loginfo(f"Поворот {i+1}/8: на {self.current_yaw}°")
+            
+            # Поворачиваемся
+            self.set_yaw(yaw=self.current_yaw, frame_id='aruco_map')
+            rospy.sleep(8)
+            
+            # Проверяем, видим ли человека
+            target = self.select_target()
+            if target is not None:
+                rospy.loginfo(f"Нашёл человека! Поворот {i+1}")
+                return target
+        
+        rospy.logwarn("Человек не найден после полного оборота")
+        return None
+
     def run(self):
-        """Основной цикл управления"""
-        rate = rospy.Rate(20)  # 20 Гц
+        # Взлёт
+        rospy.loginfo(f"Взлёт на {self.height} м")
+        if not self.navigate_wait(z=self.height, frame_id='body', auto_arm=True):
+            return
+        
+        # Обновляем позицию после взлёта
+        rospy.sleep(2)
+        self.update_pose()
+        
+        # Летим к точке x=2, y=2 через ArUco карту
+        rospy.loginfo("Летим к точке x=2, y=2")
+        self.navigate_to_aruco_point(target_x=2, target_y=2)
+        
+        # Поиск человека с поворотами
+        target = self.search_for_person()
+        if target is None:
+            rospy.logerr("Человек не найден, сажусь...")
+            self.land()
+            return
+        
+        self.selected_target = target
+        rospy.loginfo("Цель выбрана, начинаю сопровождение на 120 секунд")
+        
+        # Основной цикл сопровождения
+        self.tracking_start = time.time()
+        rate = rospy.Rate(20)
         
         while not rospy.is_shutdown():
-            current_time = time.time()
-            
-            # Проверка времени миссии
-            if current_time - self.start_time > self.max_attempts:
-                rospy.logerr("Превышено максимальное время миссии")
-                self.state = "LAND"
-            
-            if self.state == "INIT":
-                rospy.loginfo("Начало миссии")
-                self.state = "TAKEOFF"
-            
-            elif self.state == "TAKEOFF":
-                rospy.loginfo("Выполняется взлёт...")
-                self.navigate(x=0, y=0, z=self.working_height, speed=0.5, 
-                            frame_id='body', auto_arm=True)
-                rospy.sleep(5)
-                self.state = "DETECTING"
-            
-            elif self.state == "DETECTING":
-                if self.current_detections:
-                    target = self.select_target()
-                    if target:
-                        self.target_id = target.id
-                        self.current_target = target
-                        self.state = "TRACKING"
-                        self.tracking_start_time = current_time
-                        rospy.loginfo(f"Цель обнаружена, начинаем сопровождение (ID: {self.target_id})")
-                    else:
-                        rospy.loginfo("Поиск цели...")
-                        # Медленное вращение для поиска
-                        self.set_yaw(yaw_rate=15, frame_id='body')
-                else:
-                    rospy.loginfo("Ожидание детекций...")
-                rospy.sleep(0.1)
-            
-            elif self.state == "TRACKING":
-                # Проверка времени сопровождения
-                if current_time - self.tracking_start_time >= self.tracking_time:
-                    rospy.loginfo("Сопровождение завершено успешно")
-                    self.state = "RETURN"
-                    continue
-                
-                # Поиск текущей цели среди детекций
-                current_target = None
-                for det in self.current_detections:
-                    if det.id == self.target_id and det.class_name == 'target_person':
-                        current_target = det
-                        break
-                
-                if current_target:
-                    self.lost_counter = 0
-                    self.current_target = current_target
-                    
-                    # Проверка дальномера
-                    if self.current_range is not None:
-                        # Проверка безопасной дистанции
-                        if self.current_range < self.min_safe_distance:
-                            rospy.logwarn("Слишком близко к цели, отлетаем назад")
-                            self.set_velocity(vx=-0.3, vy=0, vz=0, yaw_rate=0, frame_id='body')
-                        else:
-                            # Расчет управления
-                            vx, vy, yaw_rate = self.calculate_control(current_target, self.current_range)
-                            
-                            # Вывод отладочной информации
-                            rospy.loginfo(f"Tracking: Dist={self.current_range:.2f}m, "
-                                        f"Yaw_rate={yaw_rate:.1f}deg/s, "
-                                        f"Score={current_target.score:.2f}")
-                            
-                            # Отправка команды
-                            self.set_velocity(vx=vx, vy=vy, vz=0, yaw_rate=yaw_rate, 
-                                            frame_id='body')
-                    else:
-                        rospy.logwarn("Нет данных дальномера")
-                        # Только поворот на цель
-                        if current_target:
-                            center_error = current_target.bbox.center.x - 0.5
-                            yaw_rate = self.kp_yaw * center_error * self.max_yaw_rate
-                            self.set_velocity(vx=0, vy=0, vz=0, yaw_rate=yaw_rate, 
-                                            frame_id='body')
-                else:
-                    self.lost_counter += 1
-                    rospy.logwarn(f"Цель потеряна, кадров без детекции: {self.lost_counter}")
-                    
-                    if self.lost_counter >= self.max_lost_frames:
-                        self.state = "LOST"
-                    else:
-                        # Попытка восстановления - медленное вращение
-                        self.set_velocity(vx=0, vy=0, vz=0, yaw_rate=10, frame_id='body')
-            
-            elif self.state == "LOST":
-                rospy.loginfo("Потеря цели, пытаемся восстановить...")
-                
-                # Поиск цели среди всех детекций
-                target = self.select_target()
-                if target:
-                    self.target_id = target.id
-                    self.current_target = target
-                    self.lost_counter = 0
-                    self.state = "TRACKING"
-                    rospy.loginfo(f"Цель восстановлена (ID: {self.target_id})")
-                else:
-                    # Медленное вращение для поиска
-                    self.set_yaw(yaw_rate=15, frame_id='body')
-                    rospy.sleep(0.1)
-            
-            elif self.state == "RETURN":
-                rospy.loginfo("Возврат на базу...")
-                # Возврат в стартовую позицию
-                self.navigate(x=0, y=0, z=self.working_height, speed=0.5, 
-                            frame_id='map', auto_arm=False)
-                rospy.sleep(5)
-                self.state = "LAND"
-            
-            elif self.state == "LAND":
-                rospy.loginfo("Выполняется посадка...")
-                self.land()
-                rospy.signal_shutdown("Миссия завершена")
+            # Проверка времени
+            elapsed = time.time() - self.tracking_start
+            if elapsed >= self.tracking_time:
+                rospy.loginfo(f"Сопровождение завершено ({self.tracking_time} сек)")
                 break
             
+            # Ищем текущую цель по IOU
+            current_target = None
+            if self.detections:
+                for d in self.detections.detections:
+                    if d.class_name != "person":
+                        continue
+                    if self.selected_target is not None:
+                        if self.iou(self.selected_target, d) > 0.5:
+                            current_target = d
+                            break
+                    else:
+                        current_target = d
+                        break
+            
+            # Если цель потеряна, ищем любого человека
+            if current_target is None:
+                new_target = self.select_target()
+                if new_target is not None:
+                    rospy.loginfo("Цель восстановлена")
+                    self.selected_target = new_target
+                    current_target = new_target
+                else:
+                    # Медленно вращаемся в поиске
+                    self.current_yaw += 10
+                    self.set_yaw(yaw=self.current_yaw, frame_id='map')
+                    self.keep_height()
+                    rate.sleep()
+                    continue
+            else:
+                self.selected_target = current_target
+            
+            # Управление по дальности
+            if self.range is not None:
+                err_dist = self.range - self.target_distance
+                move_x = self.kp_dist * err_dist
+                move_x = max(-self.speed_fwd, min(self.speed_fwd, move_x))
+                
+                # Используем set_position для движения вперёд/назад
+                self.update_pose()
+                if self.current_pose:
+                    self.set_position(x=self.current_pose.x + move_x * 0.1,
+                                    y=self.current_pose.y,
+                                    z=self.height,
+                                    frame_id='map')
+                
+                # Логирование каждые 5 секунд
+                if int(elapsed) % 5 == 0:
+                    rospy.loginfo(
+                        f"Сопровождение: {elapsed:.0f}/{self.tracking_time} сек | "
+                        f"Дист: {self.range:.2f}м | MoveX: {move_x:.2f}")
+            else:
+                rospy.logwarn_throttle(1, "Нет данных дальномера")
+            
+            # Поддерживаем высоту
+            self.keep_height()
             rate.sleep()
+        
+        # Возврат на старт через ArUco карту
+        rospy.loginfo("Возврат на старт (0, 0)")
+        self.navigate_to_aruco_point(target_x=0, target_y=0)
+        
+        # Посадка
+        rospy.loginfo("Посадка")
+        self.land()
+        rospy.loginfo("Миссия завершена")
 
 if __name__ == '__main__':
     try:
-        tracker = TargetTracker()
-        tracker.run()
+        PersonTracker().run()
     except rospy.ROSInterruptException:
         pass
