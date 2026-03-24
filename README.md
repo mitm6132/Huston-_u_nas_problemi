@@ -38,7 +38,7 @@
 |:---|:---|
 | **Операционная система** | Ubuntu 20.04 |
 | **Middleware** | ROS Noetic |
-| **Языки программирования** | Python 3, C++ |
+| **Языки программирования** | Python 3|
 | **Компьютерное зрение** | TensorFlow Lite, OpenCV |
 | **Управление полетом** | MAVROS, PX4/ArduPilot |
 | **Визуализация** | rviz, rqt |
@@ -56,15 +56,6 @@
 | `/camera/image_raw` | `sensor_msgs/Image` | Изображение с бортовой камеры |
 | `/detection/objects` | `vision_msgs/Detection2DArray` | Обнаруженные объекты (люди, препятствия) |
 | `/drone/state` | `mavros_msgs/State` | Состояние дрона (armed, connected, mode) |
-
-### Используемые сервисы
-
-| Сервис | Тип | Назначение |
-|:---|:---|:---|
-| `/mavros/cmd/arming` | `mavros_msgs/CommandBool` | Включение/выключение моторов |
-| `/mavros/set_mode` | `mavros_msgs/SetMode` | Переключение режимов полета (OFFBOARD, AUTO, LAND) |
-
----
 
 ## 🧠 Архитектура решения
 
