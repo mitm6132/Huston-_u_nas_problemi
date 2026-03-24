@@ -39,9 +39,9 @@ class TargetTracker:
         self.max_speed_y = 0.3            # максимальная скорость по Y, м/с
 
         # Параметры поиска
-        self.search_speed = 0.2           # скорость движения при поиске, м/с (чуть медленнее)
+        self.search_speed = 0.2           # скорость движения при поиске, м/с
         self.search_step_time = 2.0       # время движения в одном направлении, сек
-        self.lost_wait = 1.5              # пауза перед началом поиска (увеличена)
+        self.lost_wait = 1.5              # пауза перед началом поиска, сек
 
         # Состояние
         self.state = 'SEARCH'             # SEARCH, TRACK
@@ -64,7 +64,8 @@ class TargetTracker:
         self.image_height = msg.height
 
     def navigate_wait(self, x=0, y=0, z=0, yaw=float('nan'), speed=0.5,
-                      frame_id='map', tolerance=0.2, auto_arm=False):
+                      frame_id='aruco_map', tolerance=0.2, auto_arm=False):
+        """Блокирующая команда для абсолютных перемещений (aruco_map)"""
         res = self.navigate(x=x, y=y, z=z, yaw=yaw, speed=speed,
                             frame_id=frame_id, auto_arm=auto_arm)
         if not res.success:
@@ -79,7 +80,8 @@ class TargetTracker:
         return False
 
     def hold_height(self):
-        telem = self.get_telemetry(frame_id='map')
+        """Коррекция высоты на основе aruco_map"""
+        telem = self.get_telemetry(frame_id='aruco_map')
         err_z = self.height - telem.z
         move_z = 0.8 * err_z
         move_z = max(-0.2, min(0.2, move_z))
@@ -108,6 +110,7 @@ class TargetTracker:
         return inter / union if union > 0 else 0
 
     def send_cmd(self, move_y):
+        """Отправка команды с коррекцией высоты (движение в теле дрона)"""
         move_z = self.hold_height()
         now = time.time()
         if now - self.last_cmd_time > self.cmd_interval:
@@ -116,21 +119,24 @@ class TargetTracker:
             self.last_cmd_time = now
 
     def run(self):
-        # Взлёт
+        # --- Взлёт (абсолютная высота, но локальный взлёт) ---
         rospy.loginfo("Взлёт на %.1f м", self.height)
         if not self.navigate_wait(z=self.height, frame_id='body', auto_arm=True):
             return
-            
-        self.navigate(x = 2, y = 2, z = 1.5, frame_id = "aruco_map" )
-        rospy.sleep(5)
 
+        # --- Перелёт в точку (2,2) по карте aruco_map ---
+        rospy.loginfo("Перелёт в точку (2,2) по aruco_map")
+        if not self.navigate_wait(x=2, y=2, z=self.height, frame_id='aruco_map', speed=0.5):
+            rospy.logwarn("Не удалось достичь (2,2), продолжаем...")
+
+        # --- Стабилизация ---
         rospy.loginfo("Стабилизация 10 секунд...")
         start_stable = time.time()
         while time.time() - start_stable < 10.0:
             self.send_cmd(0.0)
             rospy.sleep(0.2)
 
-        # Основной цикл миссии
+        # --- Основной цикл миссии ---
         mission_start = time.time()
         rospy.loginfo("Миссия началась. Длительность: %.0f секунд", self.mission_duration)
         rate = rospy.Rate(10)
@@ -197,7 +203,7 @@ class TargetTracker:
                     # Управление центрированием
                     cx, _ = self.get_center(current_target)
                     err_x = cx - self.image_width / 2
-                    # Исправленный знак: цель справа (err_x>0) -> двигаемся вправо (отрицательный Y)
+                    # Движение в сторону цели: цель справа (err_x>0) -> вправо (отрицательный Y)
                     move_y = - self.kp_y * err_x
                     move_y = max(-self.max_speed_y, min(self.max_speed_y, move_y))
                     self.send_cmd(move_y)
@@ -208,7 +214,7 @@ class TargetTracker:
 
             rate.sleep()
 
-        # Возврат и посадка
+        # --- Возврат на старт и посадка ---
         rospy.loginfo("Возврат на старт")
         self.navigate_wait(x=0, y=0, z=self.height, frame_id='aruco_map', speed=0.5)
         rospy.loginfo("Посадка")
